@@ -48,6 +48,21 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+## Homework 1 solution
+
+**Approach.** Following the prompt-chaining idea from Tutorial 1, the vision model is only asked to *transcribe* each receipt, never to sum anything. For every receipt image, `deepseek-v4-flash-vision-exp` returns one small JSON object: the gross item total, the list of discount amounts before the subtotal, the SUBTOTAL line, the ROUNDING line, and the payment line immediately after ROUNDING (which is the amount actually paid). The prompt explicitly tells the model what NOT to touch — ROUNDING, change, card balance / amount deducted, points, and duplicate payment copies. A consistency gate then checks that `item_total − sum(discounts) ≈ subtotal`; on mismatch the receipt is extracted a second time with the discrepancy fed back. All aggregation is done in Python, exactly as in the expense-ledger tutorial: query 1 sums `total_paid` over every receipt, query 2 sums `subtotal + sum(discounts)` (rounding is not added back). Each final response is formatted as `HK$<amount>` so the response string contains exactly one number. On the public 7-receipt set the chain scores 2/2 across repeated runs (`HK$1974.30` and `HK$2348.20`).
+
+```mermaid
+flowchart TD
+    A["Receipt images in a folder"] --> B["Per-receipt extraction<br/>deepseek-v4-flash-vision-exp"]
+    B --> C["JSON per receipt:<br/>item_total · discounts[] · subtotal · rounding · total_paid"]
+    C --> G{"Consistency gate<br/>item_total − Σdiscounts ≈ subtotal ?"}
+    G -- "mismatch" --> R["Retry extraction<br/>with the discrepancy as feedback"]
+    G -- "pass" --> P["Python aggregation"]
+    R --> P
+    P --> Q1["Q1 = Σ total_paid"]
+    P --> Q2["Q2 = Σ (subtotal + Σ discounts)<br/>(ROUNDING not added back)"]
+    Q1 --> OUT['HK$1974.30']
+    Q2 --> OUT2['HK$2348.20']
+```
 
