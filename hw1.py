@@ -52,35 +52,129 @@ def image_data_url(path: Path) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+EXTRACTION_PROMPT = """You are an expert at reading Hong Kong supermarket receipts (labels may be English or Traditional Chinese).
+
+Look at the receipt image and extract exactly these numbers as ONE JSON object:
+
+{{
+  "item_total": <number>,                    // sum of ALL positive item prices (right-hand column) printed BEFORE the subtotal
+  "discounts": [<positive number>, ...],    // one entry per discount line printed BEFORE the subtotal
+  "subtotal": <number>,                      // amount on the "SUBTOTAL" / "小計" line (after discounts, before rounding)
+  "rounding": <number>,                      // amount on the "ROUNDING" line (small, usually negative)
+  "total_paid": <number>                     // amount actually PAID: the payment line printed IMMEDIATELY AFTER the ROUNDING line (e.g. OCTOPUS / VISA / CASH / EPS), as a positive number
+}}
+
+Rules:
+- A "discount line" is a negative amount (-$X.XX) before the subtotal next to words like 包裝變形/包裝損壞, "Buy N Save", "% OFF", "MB PRICE", coupon, member or app promotion. Record each discount as its POSITIVE value.
+- The ROUNDING line is NOT a discount. Do not put it in "discounts".
+- EXCLUDE everything else: the CHANGE/找續 ($0.00) line; the card section (Amount Deducted/扣除金額, Remaining Value/餘額, card no.); the points section (Point Balance/Points Earned/積分); a duplicate payment printed later (e.g. GP.VISA); dates, times, card numbers, phone numbers, register/ticket numbers. Positive item prices and plastic-bag charges are NOT discounts.
+- Plain decimals in HKD, no $ signs or commas.
+- Output the JSON object ONLY, no prose.
+"""
+
+RETRY_PROMPT = """You are an expert at reading Hong Kong supermarket receipts.
+
+Extract ONE JSON object from this receipt with keys:
+  "item_total" (sum of all positive item prices before subtotal),
+  "discounts" (POSITIVE amount of every discount/promotion line before the subtotal),
+  "subtotal" (SUBTOTAL/小計 line),
+  "rounding" (ROUNDING line),
+  "total_paid" (the payment amount immediately AFTER the ROUNDING line, positive).
+
+Your previous attempt FAILED a consistency check: {feedback}
+Remember: item_total - sum(discounts) must equal subtotal. ROUNDING is not a discount.
+Exclude card balance/deducted, points, change, duplicate payment copies, dates and numbers.
+Plain decimals, HKD, no $ or commas. Output the JSON object ONLY.
+"""
+
+
 def build_chain() -> Any:
     """Create and return your LangChain chain once.
 
-    Suggested imports:
-        from langchain_core.prompts import ChatPromptTemplate
-        from langchain_deepseek import ChatDeepSeek
-
-    Use the vision-capable DeepSeek Flash model named
-    ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
+    Uses deepseek-v4-flash-vision-exp. The returned object holds two vision
+    runnables: "extract" (first pass) and "retry" (consistency-check retry).
     """
-    ### YOUR CODE HERE
-    return None
+    import os
+
+    from langchain_core.output_parsers import JsonOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_deepseek import ChatDeepSeek
+
+    llm = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0.0,
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    )
+
+    def _vision_chain(template: str):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "user",
+                    [
+                        {"type": "text", "text": template},
+                        {"type": "image_url", "image_url": {"url": "{image_url}"}},
+                    ],
+                )
+            ]
+        )
+        return prompt | llm | JsonOutputParser()
+
+    return {"extract": _vision_chain(EXTRACTION_PROMPT), "retry": _vision_chain(RETRY_PROMPT)}
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
-    """Run your chain and return one response for each exact query string.
+    """Run the chain on every receipt, sum the results in Python.
 
-    ``images`` contains every receipt in the selected folder. A valid return
-    value looks like:
-
-        {QUERY_1: "HK$123.40", QUERY_2: "HK$150.00"}
-
-    Use the provided ``image_data_url(path)`` helper to put local images in
-    multimodal human messages. LangChain's ``batch`` method is one simple way
-    to process independent receipt-extraction prompts in parallel.
+    Q1 = sum of total_paid (after rounding) over all receipts.
+    Q2 = sum of (subtotal + sum of discounts) over all receipts (rounding NOT added back).
     """
-    ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    extract = chain["extract"]
+    retry = chain["retry"]
+
+    def _clean_number(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(str(value).replace("$", "").replace(",", "").strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _read_one(url: str) -> dict:
+        try:
+            record = extract.invoke({"image_url": url})
+        except Exception:
+            # First pass returned unparseable output: one retry.
+            record = retry.invoke({"image_url": url, "feedback": "the reply was not valid JSON"})
+
+        subtotal = _clean_number(record.get("subtotal"))
+        discounts = [_clean_number(d) for d in (record.get("discounts") or [])]
+        item_total = _clean_number(record.get("item_total"), default=None)
+
+        # Consistency gate: item_total - sum(discounts) should match subtotal.
+        feedback = None
+        if item_total is not None:
+            expected = item_total - sum(discounts)
+            if abs(expected - subtotal) > 0.5:
+                feedback = (
+                    f"item_total={item_total}, sum(discounts)={sum(discounts):.2f}, "
+                    f"but subtotal={subtotal}; they do not reconcile."
+                )
+        if feedback is not None:
+            fixed = retry.invoke({"image_url": url, "feedback": feedback})
+            subtotal = _clean_number(fixed.get("subtotal"), subtotal)
+            discounts = [_clean_number(d) for d in (fixed.get("discounts") or [])]
+
+        return {
+            "total_paid": _clean_number(record.get("total_paid")),
+            "subtotal": subtotal,
+            "discount_total": sum(discounts),
+        }
+
+    urls = [image_data_url(path) for path in images]
+    records = [_read_one(url) for url in urls]
+
+    q1 = sum(r["total_paid"] for r in records)
+    q2 = sum(r["subtotal"] + r["discount_total"] for r in records)
+    return {QUERY_1: f"HK${q1:.2f}", QUERY_2: f"HK${q2:.2f}"}
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
